@@ -39,11 +39,33 @@ DEFAULTS = {
     "welcome_text": "Welcome! Choose an option below.",
     "welcome_photo": "",          # legacy single photo (still supported)
     "access_link": "",
-    "approved_text": "Payment approved! Here is your access link:",
-    "declined_text": "Your payment could not be verified. Please contact the admin.",
+    # {order} and {plan} are replaced automatically in these three texts
+    "submitted_text": "✅ Request Submitted!\n\n🆔 Order #{order}\n⏳ Your plan will be activated after verification.\nYou'll receive a notification once approved.",
+    "submitted_photo": "",
+    "approved_text": "✅ Payment Approved!\n\n🆔 Order #{order} — Plan: {plan}\nHere is your access link:",
+    "approved_photo": "",
+    "declined_text": "❌ Payment Not Verified\n\n🆔 Order #{order} — Plan: {plan}\nYour payment could not be verified.\n\nPlease contact support if you believe this is an error.",
+    "declined_photo": "",
     "howto_text": "📘 How to use\n\nWatch the video above, pick your plan, pay on the QR, then tap \"✅ I have paid\" and send the payment screenshot here.",
     "report_text": "🚨 Report an Issue\n\nPlease describe your issue or send a screenshot.\nWe'll get back to you as soon as possible.",
 }
+
+PHOTO_KEYS = ("welcome_photo", "qr_photo", "submitted_photo", "approved_photo", "declined_photo")
+
+
+def render(template, order="", plan=""):
+    """Fill {order} / {plan} placeholders without crashing on other braces."""
+    return (template or "").replace("{order}", str(order)).replace("{plan}", str(plan))
+
+
+def notify(chat_id, text_key, order="", plan="", extra=""):
+    """Send the admin-configured photo + text for a status message."""
+    body = render(get(text_key), order, plan) + (("\n" + extra) if extra else "")
+    photo = get(text_key.replace("_text", "_photo"))
+    if photo:
+        return send_photo(chat_id, photo, body)
+    return send(chat_id, body)
+
 
 MEDIA_LIMIT = 10  # telegram album limit
 
@@ -315,6 +337,10 @@ def dashboard_keyboard():
              {"text": "🔗 Access link", "callback_data": "set:access_link"}],
             [{"text": "✅ Approved text", "callback_data": "set:approved_text"},
              {"text": "❌ Declined text", "callback_data": "set:declined_text"}],
+            [{"text": "🖼 Submitted photo", "callback_data": "set:submitted_photo"},
+             {"text": "📝 Submitted text", "callback_data": "set:submitted_text"}],
+            [{"text": "🖼 Approved photo", "callback_data": "set:approved_photo"},
+             {"text": "🖼 Declined photo", "callback_data": "set:declined_photo"}],
             [{"text": "📘 How-to video", "callback_data": "media:howto"},
              {"text": "📘 How-to text", "callback_data": "set:howto_text"}],
             [{"text": "🚨 Report text", "callback_data": "set:report_text"},
@@ -394,10 +420,10 @@ def decide(payment_id, approve):
 
     if approve:
         link = get("access_link")
-        text = get("approved_text") + ("\n" + link if link else "\n(link not set yet)")
-        send(row["chat_id"], text)
+        notify(row["chat_id"], "approved_text", row["id"], row["plan_label"],
+               extra=link or "(link not set yet)")
     else:
-        send(row["chat_id"], get("declined_text"))
+        notify(row["chat_id"], "declined_text", row["id"], row["plan_label"])
     return "Approved & link sent" if approve else "Declined"
 
 
@@ -481,7 +507,7 @@ def handle_message(msg):
         if parts[0] == "set":
 
             key = parts[1]
-            if key in ("welcome_photo", "qr_photo"):
+            if key in PHOTO_KEYS:
                 if not file_id or kind != "photo":
                     return send(chat_id, "Send a photo, please.")
                 put(key, file_id)
@@ -538,8 +564,7 @@ def handle_message(msg):
                 )
                 pid, label, price = cur.lastrowid, "Unknown plan", 0
 
-        send(chat_id, "Screenshot received ✅ Your payment is under review. "
-                      "You'll get your access link once the admin approves it.")
+        notify(chat_id, "submitted_text", pid, label)
         who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
         if get("admin_chat_id"):
             # the screenshot itself carries the Approve / Decline buttons
@@ -564,8 +589,7 @@ def handle_message(msg):
             if sel:
                 c.execute("UPDATE payments SET status = 'pending' WHERE id = ?", (sel["id"],))
         if sel:
-            send(chat_id, "Received ✅ Your payment is under review. "
-                          "You'll get your access link once it's verified.")
+            notify(chat_id, "submitted_text", sel["id"], sel["plan_label"])
             who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
             if get("admin_chat_id"):
                 send(get("admin_chat_id"),
@@ -730,7 +754,10 @@ def handle_callback(cq):
         answer()
         if key == "qr_photo":
             return send(chat_id, "Send the QR photo once — it will be used for ALL plans.")
-        prompt = "Send the new photo." if key == "welcome_photo" else "Send the new value."
+        prompt = "Send the new photo." if key in PHOTO_KEYS else (
+            "Send the new text. You can use {order} and {plan} placeholders."
+            if key in ("submitted_text", "approved_text", "declined_text")
+            else "Send the new value.")
         return send(chat_id, f"{prompt}\nCurrent: <code>{get(key) or '(empty)'}</code>")
 
     if data == "plans:list":
