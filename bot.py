@@ -1,21 +1,24 @@
 """
-Telegram payment bot — single file Python version.
+Telegram payment bot — single file Python version (media + dashboard edition).
 
-Same features as the web app:
-  /start           -> welcome photo + text + plan buttons + "View demo" button
-  plan button      -> sends that plan's QR photo + text
-  user sends photo -> forwarded to admin with Approve / Decline buttons
-  approve          -> customer automatically gets the access link
-  decline          -> customer gets the "not verified" message
-  /admin           -> admin menu to change prices, texts, photos and the link
+Features
+--------
+  /start            -> welcome media (up to 10 photos/videos as an album) + text
+                       + plan buttons + "View demo" button
+  plan button       -> that plan's videos/photos first, then the QR photo + text
+  user sends photo  -> forwarded to admin, Approve / Decline buttons right under it
+  approve           -> customer automatically gets the access link
+  decline           -> customer gets the "not verified" message
+  /admin            -> opens the DASHBOARD (totals, revenue, pending list)
+                       plus buttons to change prices, texts, media and the link
 
 Setup
 -----
   pip install requests
   python bot.py            (first run asks for the bot token and your chat id)
 
-Everything is stored in bot.db (SQLite) next to this file, and photos are
-stored as Telegram file_ids so no image hosting is needed.
+Everything is stored in bot.db (SQLite) next to this file, and media are stored
+as Telegram file_ids so no image/video hosting is needed.
 """
 
 import json
@@ -30,16 +33,18 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 API = "https://api.telegram.org"
 
 DEFAULTS = {
-    "bot_token": "8920151470:AAGN1bMKSksTrd37vcYqF7Hw92rTZQ_bMuk",
-    "admin_chat_id": "8657077884",
+    "bot_token": "",
+    "admin_chat_id": "",
     "welcome_text": "Welcome! Choose an option below.",
-    "welcome_photo": "",          # telegram file_id
+    "welcome_photo": "",          # legacy single photo (still supported)
     "demo_label": "View demo",
     "demo_url": "https://example.com",
     "access_link": "",
     "approved_text": "Payment approved! Here is your access link:",
     "declined_text": "Your payment could not be verified. Please contact the admin.",
 }
+
+MEDIA_LIMIT = 10  # telegram album limit
 
 
 # --------------------------------------------------------------------------- db
@@ -73,6 +78,15 @@ def init_db():
                    photo_file_id TEXT NOT NULL DEFAULT '',
                    status TEXT NOT NULL DEFAULT 'selected',
                    created_at REAL NOT NULL DEFAULT 0)"""
+        )
+        # media library: scope = 'welcome' or 'plan:<plan_id>'
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS media (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   scope TEXT NOT NULL,
+                   kind TEXT NOT NULL,              -- 'photo' | 'video'
+                   file_id TEXT NOT NULL,
+                   position INTEGER NOT NULL DEFAULT 0)"""
         )
         c.execute("CREATE TABLE IF NOT EXISTS state (chat_id TEXT PRIMARY KEY, step TEXT NOT NULL)")
         for k, v in DEFAULTS.items():
@@ -108,6 +122,30 @@ def plans(active_only=True):
         return [dict(r) for r in c.execute(q).fetchall()]
 
 
+def media_list(scope):
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM media WHERE scope = ? ORDER BY position, id", (scope,)
+        ).fetchall()]
+
+
+def media_add(scope, kind, file_id):
+    with db() as c:
+        n = c.execute("SELECT COUNT(*) AS n FROM media WHERE scope = ?", (scope,)).fetchone()["n"]
+        if n >= MEDIA_LIMIT:
+            return False
+        c.execute(
+            "INSERT INTO media (scope, kind, file_id, position) VALUES (?, ?, ?, ?)",
+            (scope, kind, file_id, n + 1),
+        )
+    return True
+
+
+def media_clear(scope):
+    with db() as c:
+        c.execute("DELETE FROM media WHERE scope = ?", (scope,))
+
+
 def set_step(chat_id, step):
     with db() as c:
         if step:
@@ -126,10 +164,28 @@ def get_step(chat_id):
     return row["step"] if row else ""
 
 
+def stats():
+    with db() as c:
+        rows = c.execute(
+            "SELECT status, COUNT(*) AS n, COALESCE(SUM(price), 0) AS total "
+            "FROM payments GROUP BY status"
+        ).fetchall()
+        users = c.execute("SELECT COUNT(DISTINCT chat_id) AS n FROM payments").fetchone()["n"]
+    by = {r["status"]: {"n": r["n"], "total": r["total"]} for r in rows}
+    return {
+        "users": users,
+        "pending": by.get("pending", {}).get("n", 0),
+        "approved": by.get("approved", {}).get("n", 0),
+        "declined": by.get("declined", {}).get("n", 0),
+        "selected": by.get("selected", {}).get("n", 0),
+        "revenue": by.get("approved", {}).get("total", 0),
+    }
+
+
 # ---------------------------------------------------------------------- telegram
 def call(method, **payload):
     token = get("bot_token")
-    res = requests.post(f"{API}/bot{token}/{method}", json=payload, timeout=60)
+    res = requests.post(f"{API}/bot{token}/{method}", json=payload, timeout=90)
     data = res.json()
     if not data.get("ok"):
         print(f"[telegram] {method} failed: {data.get('description')}")
@@ -145,11 +201,40 @@ def send(chat_id, text, keyboard=None):
 
 def send_photo(chat_id, file_id, caption="", keyboard=None):
     if not file_id:
-        return send(chat_id, caption)
+        return send(chat_id, caption, keyboard) if caption else None
     args = {"chat_id": chat_id, "photo": file_id, "caption": caption[:1024], "parse_mode": "HTML"}
     if keyboard:
         args["reply_markup"] = keyboard
     return call("sendPhoto", **args)
+
+
+def send_media(chat_id, items, caption=""):
+    """Send 1..10 photos/videos. Album when >1 (caption on the first item)."""
+    items = items[:MEDIA_LIMIT]
+    if not items:
+        return None
+    if len(items) == 1:
+        it = items[0]
+        method = "sendPhoto" if it["kind"] == "photo" else "sendVideo"
+        args = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML"}
+        args["photo" if it["kind"] == "photo" else "video"] = it["file_id"]
+        return call(method, **args)
+
+    group = []
+    for i, it in enumerate(items):
+        entry = {"type": it["kind"], "media": it["file_id"]}
+        if i == 0 and caption:
+            entry["caption"] = caption[:1024]
+            entry["parse_mode"] = "HTML"
+        group.append(entry)
+    return call("sendMediaGroup", chat_id=chat_id, media=group)
+
+
+def welcome_media():
+    items = media_list("welcome")
+    if not items and get("welcome_photo"):
+        items = [{"kind": "photo", "file_id": get("welcome_photo")}]
+    return items
 
 
 def start_keyboard():
@@ -169,17 +254,54 @@ def review_keyboard(payment_id):
     }
 
 
-def admin_keyboard():
+def dashboard_text():
+    s = stats()
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM payments WHERE status = 'pending' ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+    lines = [
+        "📊 <b>Dashboard</b>",
+        "",
+        f"👥 Customers: <b>{s['users']}</b>",
+        f"🧾 Pending review: <b>{s['pending']}</b>",
+        f"✅ Approved: <b>{s['approved']}</b>",
+        f"❌ Declined: <b>{s['declined']}</b>",
+        f"🕒 Waiting for screenshot: <b>{s['selected']}</b>",
+        f"💰 Approved revenue: <b>₹{int(s['revenue'])}</b>",
+    ]
+    if rows:
+        lines += ["", "<b>Latest pending</b>"]
+        for r in rows:
+            who = "@" + r["username"] if r["username"] else (r["full_name"] or r["chat_id"])
+            lines.append(f"• {who} — {r['plan_label']} ₹{int(r['price'])}")
+    return "\n".join(lines)
+
+
+def dashboard_keyboard():
     return {
         "inline_keyboard": [
+            [{"text": "🧾 Review payments", "callback_data": "pay:list"},
+             {"text": "🔄 Refresh", "callback_data": "dash"}],
+            [{"text": "💰 Plans & QR", "callback_data": "plans:list"},
+             {"text": "🎞 Welcome media", "callback_data": "media:welcome"}],
             [{"text": "💬 Welcome text", "callback_data": "set:welcome_text"},
-             {"text": "🖼 Welcome photo", "callback_data": "set:welcome_photo"}],
-            [{"text": "🔗 Access link", "callback_data": "set:access_link"},
-             {"text": "✅ Approved text", "callback_data": "set:approved_text"}],
-            [{"text": "❌ Declined text", "callback_data": "set:declined_text"},
-             {"text": "🎬 Demo link", "callback_data": "set:demo_url"}],
-            [{"text": "💰 Plans", "callback_data": "plans:list"},
-             {"text": "🧾 Pending payments", "callback_data": "pay:list"}],
+             {"text": "🔗 Access link", "callback_data": "set:access_link"}],
+            [{"text": "✅ Approved text", "callback_data": "set:approved_text"},
+             {"text": "❌ Declined text", "callback_data": "set:declined_text"}],
+            [{"text": "🎬 Demo link", "callback_data": "set:demo_url"}],
+        ]
+    }
+
+
+def media_keyboard(scope):
+    items = media_list(scope)
+    return {
+        "inline_keyboard": [
+            [{"text": f"➕ Add photo/video ({len(items)}/{MEDIA_LIMIT})",
+              "callback_data": f"madd:{scope}"}],
+            [{"text": "🗑 Remove all", "callback_data": f"mclr:{scope}"}],
+            [{"text": "⬅️ Dashboard", "callback_data": "dash"}],
         ]
     }
 
@@ -188,6 +310,7 @@ def plans_keyboard():
     rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"pedit:{p['id']}"}]
             for p in plans(active_only=False)]
     rows.append([{"text": "➕ Add plan", "callback_data": "pnew"}])
+    rows.append([{"text": "⬅️ Dashboard", "callback_data": "dash"}])
     return {"inline_keyboard": rows}
 
 
@@ -198,13 +321,31 @@ def plan_keyboard(pid):
              {"text": "💵 Price", "callback_data": f"pset:price:{pid}"}],
             [{"text": "📝 Reply text", "callback_data": f"pset:reply_text:{pid}"},
              {"text": "📷 QR photo", "callback_data": f"pset:qr_photo:{pid}"}],
+            [{"text": "🎞 Plan videos", "callback_data": f"media:plan:{pid}"}],
             [{"text": "🗑 Delete plan", "callback_data": f"pdel:{pid}"}],
+            [{"text": "⬅️ Plans", "callback_data": "plans:list"}],
         ]
     }
 
 
 def is_admin(chat_id):
     return str(chat_id) == str(get("admin_chat_id"))
+
+
+def extract_media(msg):
+    """Return ('photo'|'video', file_id) or (None, '')."""
+    if msg.get("photo"):
+        return "photo", msg["photo"][-1]["file_id"]
+    if msg.get("video"):
+        return "video", msg["video"]["file_id"]
+    if msg.get("animation"):
+        return "video", msg["animation"]["file_id"]
+    doc = msg.get("document") or {}
+    if str(doc.get("mime_type", "")).startswith("video/"):
+        return "video", doc["file_id"]
+    if str(doc.get("mime_type", "")).startswith("image/"):
+        return "photo", doc["file_id"]
+    return None, ""
 
 
 # ------------------------------------------------------------------- decisioning
@@ -235,9 +376,8 @@ def handle_message(msg):
     if not chat_id:
         return
     frm = msg.get("from", {}) or {}
-    text = (msg.get("text") or "").strip()
-    photos = msg.get("photo") or []
-    file_id = photos[-1]["file_id"] if photos else ""
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    kind, file_id = extract_media(msg)
 
     step = get_step(chat_id)
 
@@ -245,21 +385,36 @@ def handle_message(msg):
     if step and is_admin(chat_id):
         parts = step.split(":")
 
+        if parts[0] == "madd":
+            scope = ":".join(parts[1:])
+            if not file_id:
+                return send(chat_id, "Send a photo or a video, please.")
+            ok = media_add(scope, kind, file_id)
+            if not ok:
+                set_step(chat_id, "")
+                return send(chat_id, f"Limit reached ({MEDIA_LIMIT}).", media_keyboard(scope))
+            n = len(media_list(scope))
+            return send(
+                chat_id,
+                f"Added ✅ ({n}/{MEDIA_LIMIT}). Send another one, or tap Done.",
+                {"inline_keyboard": [[{"text": "✔️ Done", "callback_data": f"mdone:{scope}"}]]},
+            )
+
         if parts[0] == "set":
             key = parts[1]
             if key == "welcome_photo":
-                if not file_id:
+                if not file_id or kind != "photo":
                     return send(chat_id, "Send a photo, please.")
                 put("welcome_photo", file_id)
             else:
                 put(key, text)
             set_step(chat_id, "")
-            return send(chat_id, "Saved ✅", admin_keyboard())
+            return send(chat_id, "Saved ✅", dashboard_keyboard())
 
         if parts[0] == "pset":
             field, pid = parts[1], parts[2]
             value = file_id if field == "qr_photo" else text
-            if field == "qr_photo" and not value:
+            if field == "qr_photo" and (not value or kind != "photo"):
                 return send(chat_id, "Send the QR photo, please.")
             if field == "price":
                 try:
@@ -278,10 +433,10 @@ def handle_message(msg):
                     (text or "New plan", 0, "Pay on the QR above and send the screenshot here.", 99),
                 )
             set_step(chat_id, "")
-            return send(chat_id, "Plan added ✅ Now set its price and QR.", plans_keyboard())
+            return send(chat_id, "Plan added ✅ Now set its price, QR and videos.", plans_keyboard())
 
     # ---- payment screenshot from a customer ----
-    if file_id and not is_admin(chat_id):
+    if file_id and kind == "photo" and not is_admin(chat_id):
         with db() as c:
             sel = c.execute(
                 "SELECT * FROM payments WHERE chat_id = ? AND status = 'selected' "
@@ -308,6 +463,7 @@ def handle_message(msg):
                       "You'll get your access link once the admin approves it.")
         who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
         if get("admin_chat_id"):
+            # the screenshot itself carries the Approve / Decline buttons
             send_photo(
                 get("admin_chat_id"),
                 file_id,
@@ -320,12 +476,15 @@ def handle_message(msg):
     # ---- commands ----
     low = text.lower()
     if low.startswith("/start"):
-        return send_photo(chat_id, get("welcome_photo"), get("welcome_text"), start_keyboard()) \
-            if get("welcome_photo") else send(chat_id, get("welcome_text"), start_keyboard())
+        items = welcome_media()
+        if items:
+            send_media(chat_id, items, get("welcome_text"))
+            return send(chat_id, "Choose an option below 👇", start_keyboard())
+        return send(chat_id, get("welcome_text"), start_keyboard())
 
-    if low.startswith("/admin"):
+    if low.startswith("/admin") or low.startswith("/dashboard"):
         if is_admin(chat_id):
-            return send(chat_id, "Admin menu — pick what you want to change:", admin_keyboard())
+            return send(chat_id, dashboard_text(), dashboard_keyboard())
         return send(chat_id, f"Your chat id is <code>{chat_id}</code>.")
 
     send(chat_id, "Send /start to see the available plans.")
@@ -348,6 +507,11 @@ def handle_callback(cq):
             p = c.execute("SELECT * FROM plans WHERE id = ?", (pid,)).fetchone()
         if not p:
             return
+        # 1) plan videos / photos first
+        items = media_list(f"plan:{pid}")
+        if items:
+            send_media(chat_id, items, f"<b>{p['label']}</b> — ₹{int(p['price'])}")
+        # 2) then the QR
         caption = p["reply_text"] or f"{p['label']} — ₹{int(p['price'])}\nScan the QR to pay."
         send_photo(chat_id, p["qr_photo"], caption)
         send(chat_id, "After paying, send the payment screenshot here. "
@@ -366,8 +530,50 @@ def handle_callback(cq):
     if not is_admin(frm.get("id")):
         return answer("Only the admin can do this.")
 
+    if data == "dash":
+        answer()
+        set_step(chat_id, "")
+        return send(chat_id, dashboard_text(), dashboard_keyboard())
+
     if data.startswith("pay_ok:") or data.startswith("pay_no:"):
-        return answer(decide(data.split(":")[1], data.startswith("pay_ok:")))
+        result = decide(data.split(":")[1], data.startswith("pay_ok:"))
+        answer(result)
+        msg = cq.get("message", {})
+        if msg.get("message_id"):
+            mark = "✅ APPROVED" if data.startswith("pay_ok:") else "❌ DECLINED"
+            base = msg.get("caption") or ""
+            call("editMessageCaption", chat_id=chat_id, message_id=msg["message_id"],
+                 caption=f"{base}\n\n<b>{mark}</b>", parse_mode="HTML")
+        return
+
+    if data.startswith("media:"):
+        scope = data.split(":", 1)[1]          # 'welcome' or 'plan:<id>'
+        answer()
+        items = media_list(scope)
+        title = "Welcome media" if scope == "welcome" else "Plan media"
+        if items:
+            send_media(chat_id, items, f"<b>{title}</b> — current {len(items)} item(s)")
+        return send(chat_id, f"{title}: {len(items)}/{MEDIA_LIMIT} items.", media_keyboard(scope))
+
+    if data.startswith("madd:"):
+        scope = data.split(":", 1)[1]
+        set_step(chat_id, f"madd:{scope}")
+        answer()
+        return send(chat_id, "Send photos/videos one by one (up to "
+                             f"{MEDIA_LIMIT}). Tap Done when finished.",
+                    {"inline_keyboard": [[{"text": "✔️ Done", "callback_data": f"mdone:{scope}"}]]})
+
+    if data.startswith("mdone:"):
+        scope = data.split(":", 1)[1]
+        set_step(chat_id, "")
+        answer("Done")
+        return send(chat_id, "Media saved ✅", media_keyboard(scope))
+
+    if data.startswith("mclr:"):
+        scope = data.split(":", 1)[1]
+        media_clear(scope)
+        answer("Removed")
+        return send(chat_id, "All media removed.", media_keyboard(scope))
 
     if data.startswith("set:"):
         key = data.split(":")[1]
@@ -396,8 +602,10 @@ def handle_callback(cq):
         return send(chat_id, "Send the QR photo." if field == "qr_photo" else "Send the new value.")
 
     if data.startswith("pdel:"):
+        pid = data.split(":")[1]
         with db() as c:
-            c.execute("DELETE FROM plans WHERE id = ?", (data.split(":")[1],))
+            c.execute("DELETE FROM plans WHERE id = ?", (pid,))
+        media_clear(f"plan:{pid}")
         answer("Deleted")
         return send(chat_id, "Plan deleted.", plans_keyboard())
 
@@ -408,7 +616,7 @@ def handle_callback(cq):
                 "SELECT * FROM payments WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
             ).fetchall()
         if not rows:
-            return send(chat_id, "No pending payments.")
+            return send(chat_id, "No pending payments.", dashboard_keyboard())
         for r in rows:
             who = "@" + r["username"] if r["username"] else r["full_name"] or r["chat_id"]
             send_photo(
