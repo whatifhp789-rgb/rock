@@ -4,11 +4,12 @@ Telegram payment bot — single file Python version (media + dashboard edition).
 Features
 --------
   /start            -> welcome media (up to 10 photos/videos as an album) + text
-                       + plan buttons + "View demo" button
+                       + plan buttons + "How to use" / "Report an Issue" buttons
   plan button       -> that plan's videos/photos first, then the QR photo + text
   user sends photo  -> forwarded to admin, Approve / Decline buttons right under it
   approve           -> customer automatically gets the access link
   decline           -> customer gets the "not verified" message
+  report issue      -> customer's message/screenshot is forwarded to the admin
   /admin            -> opens the DASHBOARD (totals, revenue, pending list)
                        plus buttons to change prices, texts, media and the link
 
@@ -33,17 +34,15 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 API = "https://api.telegram.org"
 
 DEFAULTS = {
-    "bot_token": "8920151470:AAGN1bMKSksTrd37vcYqF7Hw92rTZQ_bMuk",
+    "bot_token": "@secret:TELEGRAM_BOT_TOKEN ",
     "admin_chat_id": "8657077884",
     "welcome_text": "Welcome! Choose an option below.",
     "welcome_photo": "",          # legacy single photo (still supported)
-    "demo_label": "View demo",
-    "demo_url": "https://example.com",
     "access_link": "",
     "approved_text": "Payment approved! Here is your access link:",
     "declined_text": "Your payment could not be verified. Please contact the admin.",
     "howto_text": "📘 How to use\n\nWatch the video above, pick your plan, pay on the QR, then tap \"✅ I have paid\" and send the payment screenshot here.",
-
+    "report_text": "🚨 Report an Issue\n\nPlease describe your issue or send a screenshot.\nWe'll get back to you as soon as possible.",
 }
 
 MEDIA_LIMIT = 10  # telegram album limit
@@ -250,9 +249,11 @@ def welcome_media():
 def start_keyboard():
     rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"plan:{p['id']}"}]
             for p in plans()]
-    rows.append([{"text": "📘 How to use", "callback_data": "howto"}])
-    if get("demo_url"):
-        rows.append([{"text": get("demo_label") or "View demo", "url": get("demo_url")}])
+    # How to use + Report an Issue side by side (same row)
+    rows.append([
+        {"text": "📘 How to use", "callback_data": "howto"},
+        {"text": "🚨 Report an Issue", "callback_data": "report"},
+    ])
     return {"inline_keyboard": rows}
 
 
@@ -263,6 +264,10 @@ def pay_keyboard(pid):
             [{"text": "❌ Cancel", "callback_data": "cancel"}],
         ]
     }
+
+
+def report_keyboard():
+    return {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "report_cancel"}]]}
 
 
 def review_keyboard(payment_id):
@@ -312,9 +317,9 @@ def dashboard_keyboard():
              {"text": "❌ Declined text", "callback_data": "set:declined_text"}],
             [{"text": "📘 How-to video", "callback_data": "media:howto"},
              {"text": "📘 How-to text", "callback_data": "set:howto_text"}],
-            [{"text": "📷 QR (all plans)", "callback_data": "set:qr_photo"}],
-            [{"text": "🎬 Demo link", "callback_data": "set:demo_url"},
-             {"text": "📢 Broadcast", "callback_data": "bcast"}],
+            [{"text": "🚨 Report text", "callback_data": "set:report_text"},
+             {"text": "📷 QR (all plans)", "callback_data": "set:qr_photo"}],
+            [{"text": "📢 Broadcast", "callback_data": "bcast"}],
         ]
 
     }
@@ -406,6 +411,28 @@ def handle_message(msg):
     kind, file_id = extract_media(msg)
 
     step = get_step(chat_id)
+
+    # ---- customer is reporting an issue ----
+    if step == "report" and not (text.lower().startswith("/")):
+        if not text and not file_id:
+            return send(chat_id, "Please describe your issue or send a screenshot.",
+                        report_keyboard())
+        set_step(chat_id, "")
+        who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
+        header = (f"🚨 <b>Issue reported</b>\nFrom: {who} (<code>{chat_id}</code>)"
+                  + (f"\n\n{text}" if text else ""))
+        admin = get("admin_chat_id")
+        if admin:
+            if file_id and kind == "photo":
+                send_photo(admin, file_id, header)
+            elif file_id:
+                call("sendVideo", chat_id=admin, video=file_id,
+                     caption=header[:1024], parse_mode="HTML")
+            else:
+                send(admin, header)
+        return send(chat_id, "✅ Thanks! Your issue has been sent to the admin. "
+                             "We'll get back to you as soon as possible.",
+                    start_keyboard())
 
     # ---- admin is filling in a value ----
     if step and is_admin(chat_id):
@@ -574,7 +601,6 @@ def handle_callback(cq):
     def answer(text=""):
         call("answerCallbackQuery", callback_query_id=cq_id, text=text)
 
-    # customer picked a plan
     if data == "howto":
         answer()
         items = media_list("howto")
@@ -584,8 +610,20 @@ def handle_callback(cq):
             send(chat_id, get("howto_text"))
         return send(chat_id, "Ready? Pick a plan 👇", start_keyboard())
 
+    if data == "report":
+        answer()
+        set_step(chat_id, "report")
+        return send(chat_id, get("report_text"), report_keyboard())
+
+    if data == "report_cancel":
+        answer("Cancelled")
+        set_step(chat_id, "")
+        return send(chat_id, "Cancelled. Choose an option below 👇", start_keyboard())
+
+    # customer picked a plan
     if data.startswith("plan:"):
         answer()
+        set_step(chat_id, "")
         pid = data.split(":")[1]
         with db() as c:
             p = c.execute("SELECT * FROM plans WHERE id = ?", (pid,)).fetchone()
