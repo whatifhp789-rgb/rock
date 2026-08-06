@@ -1,0 +1,475 @@
+"""
+Telegram payment bot — single file Python version.
+
+Same features as the web app:
+  /start           -> welcome photo + text + plan buttons + "View demo" button
+  plan button      -> sends that plan's QR photo + text
+  user sends photo -> forwarded to admin with Approve / Decline buttons
+  approve          -> customer automatically gets the access link
+  decline          -> customer gets the "not verified" message
+  /admin           -> admin menu to change prices, texts, photos and the link
+
+Setup
+-----
+  pip install requests
+  python bot.py            (first run asks for the bot token and your chat id)
+
+Everything is stored in bot.db (SQLite) next to this file, and photos are
+stored as Telegram file_ids so no image hosting is needed.
+"""
+
+import json
+import os
+import sqlite3
+import sys
+import time
+
+import requests
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+API = "https://api.telegram.org"
+
+DEFAULTS = {
+    "bot_token": "",
+    "admin_chat_id": "",
+    "welcome_text": "Welcome! Choose an option below.",
+    "welcome_photo": "",          # telegram file_id
+    "demo_label": "View demo",
+    "demo_url": "https://example.com",
+    "access_link": "",
+    "approved_text": "Payment approved! Here is your access link:",
+    "declined_text": "Your payment could not be verified. Please contact the admin.",
+}
+
+
+# --------------------------------------------------------------------------- db
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS plans (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   label TEXT NOT NULL,
+                   price REAL NOT NULL,
+                   reply_text TEXT NOT NULL DEFAULT '',
+                   qr_photo TEXT NOT NULL DEFAULT '',
+                   position INTEGER NOT NULL DEFAULT 0,
+                   active INTEGER NOT NULL DEFAULT 1)"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS payments (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   chat_id TEXT NOT NULL,
+                   username TEXT NOT NULL DEFAULT '',
+                   full_name TEXT NOT NULL DEFAULT '',
+                   plan_label TEXT NOT NULL DEFAULT '',
+                   price REAL NOT NULL DEFAULT 0,
+                   photo_file_id TEXT NOT NULL DEFAULT '',
+                   status TEXT NOT NULL DEFAULT 'selected',
+                   created_at REAL NOT NULL DEFAULT 0)"""
+        )
+        c.execute("CREATE TABLE IF NOT EXISTS state (chat_id TEXT PRIMARY KEY, step TEXT NOT NULL)")
+        for k, v in DEFAULTS.items():
+            c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+        if not c.execute("SELECT COUNT(*) AS n FROM plans").fetchone()["n"]:
+            c.executemany(
+                "INSERT INTO plans (label, price, reply_text, position) VALUES (?, ?, ?, ?)",
+                [
+                    ("Basic Plan", 49, "Pay ₹49 on the QR above and send the payment screenshot here.", 1),
+                    ("Premium Plan", 99, "Pay ₹99 on the QR above and send the payment screenshot here.", 2),
+                ],
+            )
+
+
+def get(key):
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else DEFAULTS.get(key, "")
+
+
+def put(key, value):
+    with db() as c:
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+
+
+def plans(active_only=True):
+    q = "SELECT * FROM plans" + (" WHERE active = 1" if active_only else "") + " ORDER BY position, id"
+    with db() as c:
+        return [dict(r) for r in c.execute(q).fetchall()]
+
+
+def set_step(chat_id, step):
+    with db() as c:
+        if step:
+            c.execute(
+                "INSERT INTO state (chat_id, step) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET step = excluded.step",
+                (str(chat_id), step),
+            )
+        else:
+            c.execute("DELETE FROM state WHERE chat_id = ?", (str(chat_id),))
+
+
+def get_step(chat_id):
+    with db() as c:
+        row = c.execute("SELECT step FROM state WHERE chat_id = ?", (str(chat_id),)).fetchone()
+    return row["step"] if row else ""
+
+
+# ---------------------------------------------------------------------- telegram
+def call(method, **payload):
+    token = get("bot_token")
+    res = requests.post(f"{API}/bot{token}/{method}", json=payload, timeout=60)
+    data = res.json()
+    if not data.get("ok"):
+        print(f"[telegram] {method} failed: {data.get('description')}")
+    return data
+
+
+def send(chat_id, text, keyboard=None):
+    args = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if keyboard:
+        args["reply_markup"] = keyboard
+    return call("sendMessage", **args)
+
+
+def send_photo(chat_id, file_id, caption="", keyboard=None):
+    if not file_id:
+        return send(chat_id, caption)
+    args = {"chat_id": chat_id, "photo": file_id, "caption": caption[:1024], "parse_mode": "HTML"}
+    if keyboard:
+        args["reply_markup"] = keyboard
+    return call("sendPhoto", **args)
+
+
+def start_keyboard():
+    rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"plan:{p['id']}"}]
+            for p in plans()]
+    if get("demo_url"):
+        rows.append([{"text": get("demo_label") or "View demo", "url": get("demo_url")}])
+    return {"inline_keyboard": rows}
+
+
+def review_keyboard(payment_id):
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"pay_ok:{payment_id}"},
+            {"text": "❌ Decline", "callback_data": f"pay_no:{payment_id}"},
+        ]]
+    }
+
+
+def admin_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "💬 Welcome text", "callback_data": "set:welcome_text"},
+             {"text": "🖼 Welcome photo", "callback_data": "set:welcome_photo"}],
+            [{"text": "🔗 Access link", "callback_data": "set:access_link"},
+             {"text": "✅ Approved text", "callback_data": "set:approved_text"}],
+            [{"text": "❌ Declined text", "callback_data": "set:declined_text"},
+             {"text": "🎬 Demo link", "callback_data": "set:demo_url"}],
+            [{"text": "💰 Plans", "callback_data": "plans:list"},
+             {"text": "🧾 Pending payments", "callback_data": "pay:list"}],
+        ]
+    }
+
+
+def plans_keyboard():
+    rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"pedit:{p['id']}"}]
+            for p in plans(active_only=False)]
+    rows.append([{"text": "➕ Add plan", "callback_data": "pnew"}])
+    return {"inline_keyboard": rows}
+
+
+def plan_keyboard(pid):
+    return {
+        "inline_keyboard": [
+            [{"text": "✏️ Label", "callback_data": f"pset:label:{pid}"},
+             {"text": "💵 Price", "callback_data": f"pset:price:{pid}"}],
+            [{"text": "📝 Reply text", "callback_data": f"pset:reply_text:{pid}"},
+             {"text": "📷 QR photo", "callback_data": f"pset:qr_photo:{pid}"}],
+            [{"text": "🗑 Delete plan", "callback_data": f"pdel:{pid}"}],
+        ]
+    }
+
+
+def is_admin(chat_id):
+    return str(chat_id) == str(get("admin_chat_id"))
+
+
+# ------------------------------------------------------------------- decisioning
+def decide(payment_id, approve):
+    with db() as c:
+        row = c.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not row:
+            return "Payment not found"
+        if row["status"] != "pending":
+            return f"Already {row['status']}"
+        c.execute(
+            "UPDATE payments SET status = ? WHERE id = ?",
+            ("approved" if approve else "declined", payment_id),
+        )
+
+    if approve:
+        link = get("access_link")
+        text = get("approved_text") + ("\n" + link if link else "\n(link not set yet)")
+        send(row["chat_id"], text)
+    else:
+        send(row["chat_id"], get("declined_text"))
+    return "Approved & link sent" if approve else "Declined"
+
+
+# ----------------------------------------------------------------------- handlers
+def handle_message(msg):
+    chat_id = msg.get("chat", {}).get("id")
+    if not chat_id:
+        return
+    frm = msg.get("from", {}) or {}
+    text = (msg.get("text") or "").strip()
+    photos = msg.get("photo") or []
+    file_id = photos[-1]["file_id"] if photos else ""
+
+    step = get_step(chat_id)
+
+    # ---- admin is filling in a value ----
+    if step and is_admin(chat_id):
+        parts = step.split(":")
+
+        if parts[0] == "set":
+            key = parts[1]
+            if key == "welcome_photo":
+                if not file_id:
+                    return send(chat_id, "Send a photo, please.")
+                put("welcome_photo", file_id)
+            else:
+                put(key, text)
+            set_step(chat_id, "")
+            return send(chat_id, "Saved ✅", admin_keyboard())
+
+        if parts[0] == "pset":
+            field, pid = parts[1], parts[2]
+            value = file_id if field == "qr_photo" else text
+            if field == "qr_photo" and not value:
+                return send(chat_id, "Send the QR photo, please.")
+            if field == "price":
+                try:
+                    value = float(text)
+                except ValueError:
+                    return send(chat_id, "Send a number, e.g. 49")
+            with db() as c:
+                c.execute(f"UPDATE plans SET {field} = ? WHERE id = ?", (value, pid))
+            set_step(chat_id, "")
+            return send(chat_id, "Plan updated ✅", plans_keyboard())
+
+        if parts[0] == "pnew":
+            with db() as c:
+                c.execute(
+                    "INSERT INTO plans (label, price, reply_text, position) VALUES (?, ?, ?, ?)",
+                    (text or "New plan", 0, "Pay on the QR above and send the screenshot here.", 99),
+                )
+            set_step(chat_id, "")
+            return send(chat_id, "Plan added ✅ Now set its price and QR.", plans_keyboard())
+
+    # ---- payment screenshot from a customer ----
+    if file_id and not is_admin(chat_id):
+        with db() as c:
+            sel = c.execute(
+                "SELECT * FROM payments WHERE chat_id = ? AND status = 'selected' "
+                "ORDER BY id DESC LIMIT 1",
+                (str(chat_id),),
+            ).fetchone()
+            if sel:
+                pid = sel["id"]
+                c.execute(
+                    "UPDATE payments SET photo_file_id = ?, status = 'pending' WHERE id = ?",
+                    (file_id, pid),
+                )
+                label, price = sel["plan_label"], sel["price"]
+            else:
+                cur = c.execute(
+                    "INSERT INTO payments (chat_id, username, full_name, plan_label, price, "
+                    "photo_file_id, status, created_at) VALUES (?,?,?,?,?,?,'pending',?)",
+                    (str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
+                     "Unknown plan", 0, file_id, time.time()),
+                )
+                pid, label, price = cur.lastrowid, "Unknown plan", 0
+
+        send(chat_id, "Screenshot received ✅ Your payment is under review. "
+                      "You'll get your access link once the admin approves it.")
+        who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
+        if get("admin_chat_id"):
+            send_photo(
+                get("admin_chat_id"),
+                file_id,
+                f"🧾 <b>Payment for review</b>\n{label} — ₹{int(price)}\n"
+                f"From: {who} (<code>{chat_id}</code>)",
+                review_keyboard(pid),
+            )
+        return
+
+    # ---- commands ----
+    low = text.lower()
+    if low.startswith("/start"):
+        return send_photo(chat_id, get("welcome_photo"), get("welcome_text"), start_keyboard()) \
+            if get("welcome_photo") else send(chat_id, get("welcome_text"), start_keyboard())
+
+    if low.startswith("/admin"):
+        if is_admin(chat_id):
+            return send(chat_id, "Admin menu — pick what you want to change:", admin_keyboard())
+        return send(chat_id, f"Your chat id is <code>{chat_id}</code>.")
+
+    send(chat_id, "Send /start to see the available plans.")
+
+
+def handle_callback(cq):
+    cq_id = cq["id"]
+    data = cq.get("data") or ""
+    frm = cq.get("from", {}) or {}
+    chat_id = cq.get("message", {}).get("chat", {}).get("id")
+
+    def answer(text=""):
+        call("answerCallbackQuery", callback_query_id=cq_id, text=text)
+
+    # customer picked a plan
+    if data.startswith("plan:"):
+        answer()
+        pid = data.split(":")[1]
+        with db() as c:
+            p = c.execute("SELECT * FROM plans WHERE id = ?", (pid,)).fetchone()
+        if not p:
+            return
+        caption = p["reply_text"] or f"{p['label']} — ₹{int(p['price'])}\nScan the QR to pay."
+        send_photo(chat_id, p["qr_photo"], caption)
+        send(chat_id, "After paying, send the payment screenshot here. "
+                      "The admin will verify it and send your access link.")
+        with db() as c:
+            c.execute("DELETE FROM payments WHERE chat_id = ? AND status = 'selected'", (str(chat_id),))
+            c.execute(
+                "INSERT INTO payments (chat_id, username, full_name, plan_label, price, status, "
+                "created_at) VALUES (?,?,?,?,?, 'selected', ?)",
+                (str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
+                 p["label"], p["price"], time.time()),
+            )
+        return
+
+    # everything below is admin-only
+    if not is_admin(frm.get("id")):
+        return answer("Only the admin can do this.")
+
+    if data.startswith("pay_ok:") or data.startswith("pay_no:"):
+        return answer(decide(data.split(":")[1], data.startswith("pay_ok:")))
+
+    if data.startswith("set:"):
+        key = data.split(":")[1]
+        set_step(chat_id, f"set:{key}")
+        answer()
+        prompt = "Send the new photo." if key == "welcome_photo" else "Send the new value."
+        return send(chat_id, f"{prompt}\nCurrent: <code>{get(key) or '(empty)'}</code>")
+
+    if data == "plans:list":
+        answer()
+        return send(chat_id, "Your plans:", plans_keyboard())
+
+    if data == "pnew":
+        set_step(chat_id, "pnew")
+        answer()
+        return send(chat_id, "Send the new plan's button label.")
+
+    if data.startswith("pedit:"):
+        answer()
+        return send(chat_id, "What do you want to change?", plan_keyboard(data.split(":")[1]))
+
+    if data.startswith("pset:"):
+        _, field, pid = data.split(":")
+        set_step(chat_id, f"pset:{field}:{pid}")
+        answer()
+        return send(chat_id, "Send the QR photo." if field == "qr_photo" else "Send the new value.")
+
+    if data.startswith("pdel:"):
+        with db() as c:
+            c.execute("DELETE FROM plans WHERE id = ?", (data.split(":")[1],))
+        answer("Deleted")
+        return send(chat_id, "Plan deleted.", plans_keyboard())
+
+    if data == "pay:list":
+        answer()
+        with db() as c:
+            rows = c.execute(
+                "SELECT * FROM payments WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+        if not rows:
+            return send(chat_id, "No pending payments.")
+        for r in rows:
+            who = "@" + r["username"] if r["username"] else r["full_name"] or r["chat_id"]
+            send_photo(
+                chat_id,
+                r["photo_file_id"],
+                f"🧾 {r['plan_label']} — ₹{int(r['price'])}\nFrom: {who} (<code>{r['chat_id']}</code>)",
+                review_keyboard(r["id"]),
+            )
+        return
+
+
+# --------------------------------------------------------------------------- main
+def first_run_setup():
+    if not get("bot_token"):
+        token = input("Bot token from @BotFather: ").strip()
+        put("bot_token", token)
+    if not get("admin_chat_id"):
+        print("Send /admin to your bot from your own account, then paste the chat id it replies "
+              "with. Leave empty to skip for now.")
+        admin_id = input("Your chat id: ").strip()
+        if admin_id:
+            put("admin_chat_id", admin_id)
+
+
+def main():
+    init_db()
+    first_run_setup()
+    if not get("bot_token"):
+        sys.exit("No bot token configured.")
+
+    call("deleteWebhook", drop_pending_updates=False)  # long polling mode
+    me = call("getMe")
+    if not me.get("ok"):
+        sys.exit("Invalid bot token.")
+    print(f"Bot @{me['result'].get('username')} running. Press Ctrl+C to stop.")
+
+    offset = 0
+    while True:
+        try:
+            res = requests.get(
+                f"{API}/bot{get('bot_token')}/getUpdates",
+                params={"timeout": 50, "offset": offset,
+                        "allowed_updates": json.dumps(["message", "callback_query"])},
+                timeout=70,
+            ).json()
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                try:
+                    if "message" in upd:
+                        handle_message(upd["message"])
+                    elif "callback_query" in upd:
+                        handle_callback(upd["callback_query"])
+                except Exception as exc:  # keep the bot alive on any single failure
+                    print("[error]", exc)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return
+        except Exception as exc:
+            print("[poll error]", exc)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
