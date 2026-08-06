@@ -33,8 +33,8 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 API = "https://api.telegram.org"
 
 DEFAULTS = {
-    "bot_token": "",
-    "admin_chat_id": "",
+    "bot_token": "8920151470:AAGN1bMKSksTrd37vcYqF7Hw92rTZQ_bMuk",
+    "admin_chat_id": "8657077884",
     "welcome_text": "Welcome! Choose an option below.",
     "welcome_photo": "",          # legacy single photo (still supported)
     "demo_label": "View demo",
