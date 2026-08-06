@@ -42,6 +42,8 @@ DEFAULTS = {
     "access_link": "",
     "approved_text": "Payment approved! Here is your access link:",
     "declined_text": "Your payment could not be verified. Please contact the admin.",
+    "howto_text": "📘 How to use\n\nWatch the video above, pick your plan, pay on the QR, then tap \"✅ I have paid\" and send the payment screenshot here.",
+
 }
 
 MEDIA_LIMIT = 10  # telegram album limit
@@ -240,9 +242,19 @@ def welcome_media():
 def start_keyboard():
     rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"plan:{p['id']}"}]
             for p in plans()]
+    rows.append([{"text": "📘 How to use", "callback_data": "howto"}])
     if get("demo_url"):
         rows.append([{"text": get("demo_label") or "View demo", "url": get("demo_url")}])
     return {"inline_keyboard": rows}
+
+
+def pay_keyboard(pid):
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ I have paid", "callback_data": f"paid:{pid}"}],
+            [{"text": "❌ Cancel", "callback_data": "cancel"}],
+        ]
+    }
 
 
 def review_keyboard(payment_id):
@@ -252,6 +264,7 @@ def review_keyboard(payment_id):
             {"text": "❌ Decline", "callback_data": f"pay_no:{payment_id}"},
         ]]
     }
+
 
 
 def dashboard_text():
@@ -289,7 +302,10 @@ def dashboard_keyboard():
              {"text": "🔗 Access link", "callback_data": "set:access_link"}],
             [{"text": "✅ Approved text", "callback_data": "set:approved_text"},
              {"text": "❌ Declined text", "callback_data": "set:declined_text"}],
+            [{"text": "📘 How-to video", "callback_data": "media:howto"},
+             {"text": "📘 How-to text", "callback_data": "set:howto_text"}],
             [{"text": "🎬 Demo link", "callback_data": "set:demo_url"}],
+
         ]
     }
 
@@ -500,6 +516,15 @@ def handle_callback(cq):
         call("answerCallbackQuery", callback_query_id=cq_id, text=text)
 
     # customer picked a plan
+    if data == "howto":
+        answer()
+        items = media_list("howto")
+        if items:
+            send_media(chat_id, items, get("howto_text"))
+        else:
+            send(chat_id, get("howto_text"))
+        return send(chat_id, "Ready? Pick a plan 👇", start_keyboard())
+
     if data.startswith("plan:"):
         answer()
         pid = data.split(":")[1]
@@ -511,11 +536,8 @@ def handle_callback(cq):
         items = media_list(f"plan:{pid}")
         if items:
             send_media(chat_id, items, f"<b>{p['label']}</b> — ₹{int(p['price'])}")
-        # 2) then the QR
+        # 2) then the QR with the "I have paid" / "Cancel" buttons under it
         caption = p["reply_text"] or f"{p['label']} — ₹{int(p['price'])}\nScan the QR to pay."
-        send_photo(chat_id, p["qr_photo"], caption)
-        send(chat_id, "After paying, send the payment screenshot here. "
-                      "The admin will verify it and send your access link.")
         with db() as c:
             c.execute("DELETE FROM payments WHERE chat_id = ? AND status = 'selected'", (str(chat_id),))
             c.execute(
@@ -524,7 +546,20 @@ def handle_callback(cq):
                 (str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
                  p["label"], p["price"], time.time()),
             )
+        send_photo(chat_id, p["qr_photo"], caption, pay_keyboard(pid))
         return
+
+    if data.startswith("paid:"):
+        answer("Now send the screenshot")
+        return send(chat_id, "Great ✅ Now send the payment screenshot here. "
+                             "The admin will verify it and send your access link.")
+
+    if data == "cancel":
+        answer("Cancelled")
+        with db() as c:
+            c.execute("DELETE FROM payments WHERE chat_id = ? AND status = 'selected'", (str(chat_id),))
+        return send(chat_id, "Cancelled. Choose a plan whenever you're ready 👇", start_keyboard())
+
 
     # everything below is admin-only
     if not is_admin(frm.get("id")):
