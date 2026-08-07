@@ -1,41 +1,40 @@
 """
 Telegram payment bot — single file Python version (media + dashboard edition).
 
-Features
---------
-  /start            -> welcome media (up to 10 photos/videos as an album) + text
-                       + plan buttons + "How to use" / "Report an Issue" buttons
-  plan button       -> that plan's videos/photos first, then the QR photo + text
-  user sends photo  -> forwarded to admin, Approve / Decline buttons right under it
-  approve           -> customer automatically gets the access link
-  decline           -> customer gets the "not verified" message
-  report issue      -> customer's message/screenshot is forwarded to the admin
-  /admin            -> opens the DASHBOARD (totals, revenue, pending list)
-                       plus buttons to change prices, texts, media and the link
+Fixes in this version
+---------------------
+1. No more 3–4 duplicate replies:
+   * single-instance lock (bot.lock) — a second copy of the script refuses to run
+   * processed update_id table — the same update is never handled twice
+   * media-group (album) dedupe — an album of screenshots = ONE request, one reply
+   * getUpdates offset is confirmed before handling
+2. Every request now gets its own random 4-digit Order ID (e.g. #4821).
+3. The text sent after the QR always starts with the ✅ tick logo.
 
 Setup
 -----
   pip install requests
   python bot.py            (first run asks for the bot token and your chat id)
-
-Everything is stored in bot.db (SQLite) next to this file, and media are stored
-as Telegram file_ids so no image/video hosting is needed.
 """
 
+import atexit
 import json
 import os
+import random
 import sqlite3
 import sys
 import time
 
 import requests
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "bot.db")
+LOCK_PATH = os.path.join(BASE_DIR, "bot.lock")
 API = "https://api.telegram.org"
 
 DEFAULTS = {
-    "bot_token": "8959356690:AAFbJp2MCgqAzeFESxFuyopl7c026cVcROk",
-    "admin_chat_id": "7431786238",
+    "bot_token": "8920151470:AAGN1bMKSksTrd37vcYqF7Hw92rTZQ_bMuk",
+    "admin_chat_id": "8657077884",
     "welcome_text": "Welcome! Choose an option below.",
     "welcome_photo": "",          # legacy single photo (still supported)
     "access_link": "",
@@ -52,6 +51,27 @@ DEFAULTS = {
 
 PHOTO_KEYS = ("welcome_photo", "qr_photo", "submitted_photo", "approved_photo", "declined_photo")
 
+MEDIA_LIMIT = 10  # telegram album limit
+
+
+def new_order_code():
+    """Random 4-digit order id, unique among existing payments."""
+    with db() as c:
+        for _ in range(50):
+            code = str(random.randint(1000, 9999))
+            row = c.execute(
+                "SELECT 1 FROM payments WHERE order_code = ?", (code,)
+            ).fetchone()
+            if not row:
+                return code
+    return str(random.randint(1000, 9999))
+
+
+def tick(text):
+    """Make sure the message starts with the ✅ tick logo."""
+    text = (text or "").lstrip()
+    return text if text.startswith("✅") else "✅ " + text
+
 
 def render(template, order="", plan=""):
     """Fill {order} / {plan} placeholders without crashing on other braces."""
@@ -67,12 +87,9 @@ def notify(chat_id, text_key, order="", plan="", extra=""):
     return send(chat_id, body)
 
 
-MEDIA_LIMIT = 10  # telegram album limit
-
-
 # --------------------------------------------------------------------------- db
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -93,15 +110,23 @@ def init_db():
         c.execute(
             """CREATE TABLE IF NOT EXISTS payments (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   order_code TEXT NOT NULL DEFAULT '',
                    chat_id TEXT NOT NULL,
                    username TEXT NOT NULL DEFAULT '',
                    full_name TEXT NOT NULL DEFAULT '',
                    plan_label TEXT NOT NULL DEFAULT '',
                    price REAL NOT NULL DEFAULT 0,
                    photo_file_id TEXT NOT NULL DEFAULT '',
+                   media_group_id TEXT NOT NULL DEFAULT '',
                    status TEXT NOT NULL DEFAULT 'selected',
                    created_at REAL NOT NULL DEFAULT 0)"""
         )
+        # older databases: add the new columns if they are missing
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()}
+        if "order_code" not in cols:
+            c.execute("ALTER TABLE payments ADD COLUMN order_code TEXT NOT NULL DEFAULT ''")
+        if "media_group_id" not in cols:
+            c.execute("ALTER TABLE payments ADD COLUMN media_group_id TEXT NOT NULL DEFAULT ''")
         # media library: scope = 'welcome' or 'plan:<plan_id>'
         c.execute(
             """CREATE TABLE IF NOT EXISTS media (
@@ -112,6 +137,12 @@ def init_db():
                    position INTEGER NOT NULL DEFAULT 0)"""
         )
         c.execute("CREATE TABLE IF NOT EXISTS state (chat_id TEXT PRIMARY KEY, step TEXT NOT NULL)")
+        # every update_id we already handled -> guarantees no duplicate replies
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS seen_updates (
+                   update_id INTEGER PRIMARY KEY,
+                   created_at REAL NOT NULL DEFAULT 0)"""
+        )
         for k, v in DEFAULTS.items():
             c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
         if not c.execute("SELECT COUNT(*) AS n FROM plans").fetchone()["n"]:
@@ -122,6 +153,20 @@ def init_db():
                     ("Premium Plan", 99, "Pay ₹99 on the QR above and send the payment screenshot here.", 2),
                 ],
             )
+
+
+def already_handled(update_id):
+    """True if this update_id was processed before (duplicate delivery)."""
+    with db() as c:
+        try:
+            c.execute(
+                "INSERT INTO seen_updates (update_id, created_at) VALUES (?, ?)",
+                (int(update_id), time.time()),
+            )
+        except sqlite3.IntegrityError:
+            return True
+        c.execute("DELETE FROM seen_updates WHERE created_at < ?", (time.time() - 86400,))
+    return False
 
 
 def get(key):
@@ -271,7 +316,6 @@ def welcome_media():
 def start_keyboard():
     rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"plan:{p['id']}"}]
             for p in plans()]
-    # How to use + Report an Issue side by side (same row)
     rows.append([
         {"text": "📘 How to use", "callback_data": "howto"},
         {"text": "🚨 Report an Issue", "callback_data": "report"},
@@ -301,7 +345,6 @@ def review_keyboard(payment_id):
     }
 
 
-
 def dashboard_text():
     s = stats()
     with db() as c:
@@ -322,7 +365,8 @@ def dashboard_text():
         lines += ["", "<b>Latest pending</b>"]
         for r in rows:
             who = "@" + r["username"] if r["username"] else (r["full_name"] or r["chat_id"])
-            lines.append(f"• {who} — {r['plan_label']} ₹{int(r['price'])}")
+            code = r["order_code"] or r["id"]
+            lines.append(f"• #{code} {who} — {r['plan_label']} ₹{int(r['price'])}")
     return "\n".join(lines)
 
 
@@ -347,7 +391,6 @@ def dashboard_keyboard():
              {"text": "📷 QR (all plans)", "callback_data": "set:qr_photo"}],
             [{"text": "📢 Broadcast", "callback_data": "bcast"}],
         ]
-
     }
 
 
@@ -418,12 +461,13 @@ def decide(payment_id, approve):
             ("approved" if approve else "declined", payment_id),
         )
 
+    code = row["order_code"] or row["id"]
     if approve:
         link = get("access_link")
-        notify(row["chat_id"], "approved_text", row["id"], row["plan_label"],
+        notify(row["chat_id"], "approved_text", code, row["plan_label"],
                extra=link or "(link not set yet)")
     else:
-        notify(row["chat_id"], "declined_text", row["id"], row["plan_label"])
+        notify(row["chat_id"], "declined_text", code, row["plan_label"])
     return "Approved & link sent" if approve else "Declined"
 
 
@@ -435,6 +479,7 @@ def handle_message(msg):
     frm = msg.get("from", {}) or {}
     text = (msg.get("text") or msg.get("caption") or "").strip()
     kind, file_id = extract_media(msg)
+    group_id = str(msg.get("media_group_id") or "")
 
     step = get_step(chat_id)
 
@@ -473,6 +518,9 @@ def handle_message(msg):
                 set_step(chat_id, "")
                 return send(chat_id, f"Limit reached ({MEDIA_LIMIT}).", media_keyboard(scope))
             n = len(media_list(scope))
+            if group_id:
+                # album: stay quiet for the extra items, confirm once at the end
+                return None
             return send(
                 chat_id,
                 f"Added ✅ ({n}/{MEDIA_LIMIT}). Send another one, or tap Done.",
@@ -505,7 +553,6 @@ def handle_message(msg):
                         dashboard_keyboard())
 
         if parts[0] == "set":
-
             key = parts[1]
             if key in PHOTO_KEYS:
                 if not file_id or kind != "photo":
@@ -543,6 +590,14 @@ def handle_message(msg):
     # ---- payment screenshot from a customer ----
     if file_id and kind == "photo" and not is_admin(chat_id):
         with db() as c:
+            # album of screenshots -> only the first photo creates the request
+            if group_id:
+                dup = c.execute(
+                    "SELECT 1 FROM payments WHERE chat_id = ? AND media_group_id = ?",
+                    (str(chat_id), group_id),
+                ).fetchone()
+                if dup:
+                    return None
             sel = c.execute(
                 "SELECT * FROM payments WHERE chat_id = ? AND status = 'selected' "
                 "ORDER BY id DESC LIMIT 1",
@@ -551,27 +606,30 @@ def handle_message(msg):
             if sel:
                 pid = sel["id"]
                 c.execute(
-                    "UPDATE payments SET photo_file_id = ?, status = 'pending' WHERE id = ?",
-                    (file_id, pid),
+                    "UPDATE payments SET photo_file_id = ?, media_group_id = ?, "
+                    "status = 'pending' WHERE id = ?",
+                    (file_id, group_id, pid),
                 )
-                label, price = sel["plan_label"], sel["price"]
+                label, price, code = sel["plan_label"], sel["price"], sel["order_code"]
             else:
+                code = new_order_code()
                 cur = c.execute(
-                    "INSERT INTO payments (chat_id, username, full_name, plan_label, price, "
-                    "photo_file_id, status, created_at) VALUES (?,?,?,?,?,?,'pending',?)",
-                    (str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
-                     "Unknown plan", 0, file_id, time.time()),
+                    "INSERT INTO payments (order_code, chat_id, username, full_name, plan_label, "
+                    "price, photo_file_id, media_group_id, status, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,'pending',?)",
+                    (code, str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
+                     "Unknown plan", 0, file_id, group_id, time.time()),
                 )
                 pid, label, price = cur.lastrowid, "Unknown plan", 0
 
-        notify(chat_id, "submitted_text", pid, label)
+        code = code or str(pid)
+        notify(chat_id, "submitted_text", code, label)
         who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
         if get("admin_chat_id"):
-            # the screenshot itself carries the Approve / Decline buttons
             send_photo(
                 get("admin_chat_id"),
                 file_id,
-                f"🧾 <b>Payment for review</b>\n{label} — ₹{int(price)}\n"
+                f"🧾 <b>Payment for review</b>\n🆔 Order #{code}\n{label} — ₹{int(price)}\n"
                 f"From: {who} (<code>{chat_id}</code>)",
                 review_keyboard(pid),
             )
@@ -589,18 +647,18 @@ def handle_message(msg):
             if sel:
                 c.execute("UPDATE payments SET status = 'pending' WHERE id = ?", (sel["id"],))
         if sel:
-            notify(chat_id, "submitted_text", sel["id"], sel["plan_label"])
+            code = sel["order_code"] or sel["id"]
+            notify(chat_id, "submitted_text", code, sel["plan_label"])
             who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
             if get("admin_chat_id"):
                 send(get("admin_chat_id"),
-                     f"🧾 <b>Payment for review (UTR)</b>\n{sel['plan_label']} — "
-                     f"₹{int(sel['price'])}\nUTR: <code>{text}</code>\n"
+                     f"🧾 <b>Payment for review (UTR)</b>\n🆔 Order #{code}\n"
+                     f"{sel['plan_label']} — ₹{int(sel['price'])}\nUTR: <code>{text}</code>\n"
                      f"From: {who} (<code>{chat_id}</code>)",
                      review_keyboard(sel["id"]))
             return
 
     # ---- commands ----
-
     if low.startswith("/start"):
         items = welcome_media()
         if items:
@@ -658,13 +716,15 @@ def handle_callback(cq):
         if items:
             send_media(chat_id, items, f"<b>{p['label']}</b> — ₹{int(p['price'])}")
         # 2) then the QR with the "I have paid" / "Cancel" buttons under it
-        caption = p["reply_text"] or f"{p['label']} — ₹{int(p['price'])}\nScan the QR to pay."
+        code = new_order_code()
+        base = p["reply_text"] or f"{p['label']} — ₹{int(p['price'])}\nScan the QR to pay."
+        caption = tick(base) + f"\n\n🆔 Order #{code}"
         with db() as c:
             c.execute("DELETE FROM payments WHERE chat_id = ? AND status = 'selected'", (str(chat_id),))
             c.execute(
-                "INSERT INTO payments (chat_id, username, full_name, plan_label, price, status, "
-                "created_at) VALUES (?,?,?,?,?, 'selected', ?)",
-                (str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
+                "INSERT INTO payments (order_code, chat_id, username, full_name, plan_label, "
+                "price, status, created_at) VALUES (?,?,?,?,?,?, 'selected', ?)",
+                (code, str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
                  p["label"], p["price"], time.time()),
             )
         qr = p["qr_photo"] or get("qr_photo")
@@ -679,13 +739,11 @@ def handle_callback(cq):
                              "📝 Type your UTR / Transaction ID\n\n"
                              "We'll verify and activate your plan within 30 minutes.")
 
-
     if data == "cancel":
         answer("Cancelled")
         with db() as c:
             c.execute("DELETE FROM payments WHERE chat_id = ? AND status = 'selected'", (str(chat_id),))
         return send(chat_id, "Cancelled. Choose a plan whenever you're ready 👇", start_keyboard())
-
 
     # everything below is admin-only
     if not is_admin(frm.get("id")):
@@ -700,7 +758,6 @@ def handle_callback(cq):
 
     if data == "dash":
         answer()
-
         set_step(chat_id, "")
         return send(chat_id, dashboard_text(), dashboard_keyboard())
 
@@ -716,7 +773,6 @@ def handle_callback(cq):
             else:
                 call("editMessageText", chat_id=chat_id, message_id=msg["message_id"],
                      text=f"{msg.get('text', '')}\n\n<b>{mark}</b>", parse_mode="HTML")
-
         return
 
     if data.startswith("media:"):
@@ -797,19 +853,49 @@ def handle_callback(cq):
             return send(chat_id, "No pending payments.", dashboard_keyboard())
         for r in rows:
             who = "@" + r["username"] if r["username"] else r["full_name"] or r["chat_id"]
+            code = r["order_code"] or r["id"]
             send_photo(
                 chat_id,
                 r["photo_file_id"],
-                f"🧾 {r['plan_label']} — ₹{int(r['price'])}\nFrom: {who} (<code>{r['chat_id']}</code>)",
+                f"🧾 Order #{code} — {r['plan_label']} ₹{int(r['price'])}\n"
+                f"From: {who} (<code>{r['chat_id']}</code>)",
                 review_keyboard(r["id"]),
             )
         return
 
 
+# ------------------------------------------------------------------ single copy
+def acquire_lock():
+    """Refuse to start when another copy of the bot is already polling."""
+    if os.path.exists(LOCK_PATH):
+        try:
+            old_pid = int(open(LOCK_PATH).read().strip() or 0)
+        except ValueError:
+            old_pid = 0
+        alive = False
+        if old_pid:
+            try:
+                os.kill(old_pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if alive:
+            sys.exit(
+                f"Another bot instance is already running (pid {old_pid}).\n"
+                "Stop it first — two copies polling at once cause duplicate replies."
+            )
+        os.remove(LOCK_PATH)
+    with open(LOCK_PATH, "w") as fh:
+        fh.write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(LOCK_PATH) and os.remove(LOCK_PATH))
+
+
 # --------------------------------------------------------------------------- main
 def first_run_setup():
     if not get("bot_token"):
-        token = input("Bot token from @BotFather: ").strip()
+        token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        if not token:
+            token = input("Bot token from @BotFather: ").strip()
         put("bot_token", token)
     if not get("admin_chat_id"):
         print("Send /admin to your bot from your own account, then paste the chat id it replies "
@@ -825,7 +911,10 @@ def main():
     if not get("bot_token"):
         sys.exit("No bot token configured.")
 
-    call("deleteWebhook", drop_pending_updates=False)  # long polling mode
+    acquire_lock()
+
+    # long polling mode; drop the backlog so old updates aren't replayed
+    call("deleteWebhook", drop_pending_updates=True)
     me = call("getMe")
     if not me.get("ok"):
         sys.exit("Invalid bot token.")
@@ -840,8 +929,20 @@ def main():
                         "allowed_updates": json.dumps(["message", "callback_query"])},
                 timeout=70,
             ).json()
-            for upd in res.get("result", []):
-                offset = upd["update_id"] + 1
+            updates = res.get("result", [])
+            if updates:
+                # confirm the whole batch first so Telegram never resends it
+                offset = updates[-1]["update_id"] + 1
+                try:
+                    requests.get(
+                        f"{API}/bot{get('bot_token')}/getUpdates",
+                        params={"timeout": 0, "offset": offset}, timeout=20,
+                    )
+                except Exception:
+                    pass
+            for upd in updates:
+                if already_handled(upd["update_id"]):
+                    continue
                 try:
                     if "message" in upd:
                         handle_message(upd["message"])
