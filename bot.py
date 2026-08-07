@@ -27,7 +27,7 @@ import requests
 # Config
 # --------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("8959356690:AAFbJp2MCgqAzeFESxFuyopl7c026cVcROk", "").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 PANEL_URL = os.environ.get("PANEL_URL", "").strip()  # https://your-app.lovable.app
