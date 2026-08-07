@@ -4,12 +4,11 @@ Telegram payment bot — single file Python version (media + dashboard edition).
 Features
 --------
   /start            -> welcome media (up to 10 photos/videos as an album) + text
-                       + plan buttons + "How to use" / "Report an Issue" buttons
+                       + plan buttons + "View demo" button
   plan button       -> that plan's videos/photos first, then the QR photo + text
   user sends photo  -> forwarded to admin, Approve / Decline buttons right under it
   approve           -> customer automatically gets the access link
   decline           -> customer gets the "not verified" message
-  report issue      -> customer's message/screenshot is forwarded to the admin
   /admin            -> opens the DASHBOARD (totals, revenue, pending list)
                        plus buttons to change prices, texts, media and the link
 
@@ -38,11 +37,13 @@ DEFAULTS = {
     "admin_chat_id": "8657077884",
     "welcome_text": "Welcome! Choose an option below.",
     "welcome_photo": "",          # legacy single photo (still supported)
+    "demo_label": "View demo",
+    "demo_url": "https://example.com",
     "access_link": "",
     "approved_text": "Payment approved! Here is your access link:",
     "declined_text": "Your payment could not be verified. Please contact the admin.",
     "howto_text": "📘 How to use\n\nWatch the video above, pick your plan, pay on the QR, then tap \"✅ I have paid\" and send the payment screenshot here.",
-    "report_text": "🚨 Report an Issue\n\nPlease describe your issue or send a screenshot.\nWe'll get back to you as soon as possible.",
+
 }
 
 MEDIA_LIMIT = 10  # telegram album limit
@@ -183,15 +184,7 @@ def stats():
     }
 
 
-def all_chat_ids():
-    with db() as c:
-        return [r["chat_id"] for r in c.execute(
-            "SELECT DISTINCT chat_id FROM payments"
-        ).fetchall()]
-
-
 # ---------------------------------------------------------------------- telegram
-
 def call(method, **payload):
     token = get("bot_token")
     res = requests.post(f"{API}/bot{token}/{method}", json=payload, timeout=90)
@@ -249,11 +242,9 @@ def welcome_media():
 def start_keyboard():
     rows = [[{"text": f"{p['label']} — ₹{int(p['price'])}", "callback_data": f"plan:{p['id']}"}]
             for p in plans()]
-    # How to use + Report an Issue side by side (same row)
-    rows.append([
-        {"text": "📘 How to use", "callback_data": "howto"},
-        {"text": "🚨 Report an Issue", "callback_data": "report"},
-    ])
+    rows.append([{"text": "📘 How to use", "callback_data": "howto"}])
+    if get("demo_url"):
+        rows.append([{"text": get("demo_label") or "View demo", "url": get("demo_url")}])
     return {"inline_keyboard": rows}
 
 
@@ -264,10 +255,6 @@ def pay_keyboard(pid):
             [{"text": "❌ Cancel", "callback_data": "cancel"}],
         ]
     }
-
-
-def report_keyboard():
-    return {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "report_cancel"}]]}
 
 
 def review_keyboard(payment_id):
@@ -317,11 +304,9 @@ def dashboard_keyboard():
              {"text": "❌ Declined text", "callback_data": "set:declined_text"}],
             [{"text": "📘 How-to video", "callback_data": "media:howto"},
              {"text": "📘 How-to text", "callback_data": "set:howto_text"}],
-            [{"text": "🚨 Report text", "callback_data": "set:report_text"},
-             {"text": "📷 QR (all plans)", "callback_data": "set:qr_photo"}],
-            [{"text": "📢 Broadcast", "callback_data": "bcast"}],
-        ]
+            [{"text": "🎬 Demo link", "callback_data": "set:demo_url"}],
 
+        ]
     }
 
 
@@ -351,7 +336,7 @@ def plan_keyboard(pid):
             [{"text": "✏️ Label", "callback_data": f"pset:label:{pid}"},
              {"text": "💵 Price", "callback_data": f"pset:price:{pid}"}],
             [{"text": "📝 Reply text", "callback_data": f"pset:reply_text:{pid}"},
-             {"text": "📷 QR (only this plan)", "callback_data": f"pset:qr_photo:{pid}"}],
+             {"text": "📷 QR photo", "callback_data": f"pset:qr_photo:{pid}"}],
             [{"text": "🎞 Plan videos", "callback_data": f"media:plan:{pid}"}],
             [{"text": "🗑 Delete plan", "callback_data": f"pdel:{pid}"}],
             [{"text": "⬅️ Plans", "callback_data": "plans:list"}],
@@ -412,28 +397,6 @@ def handle_message(msg):
 
     step = get_step(chat_id)
 
-    # ---- customer is reporting an issue ----
-    if step == "report" and not (text.lower().startswith("/")):
-        if not text and not file_id:
-            return send(chat_id, "Please describe your issue or send a screenshot.",
-                        report_keyboard())
-        set_step(chat_id, "")
-        who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
-        header = (f"🚨 <b>Issue reported</b>\nFrom: {who} (<code>{chat_id}</code>)"
-                  + (f"\n\n{text}" if text else ""))
-        admin = get("admin_chat_id")
-        if admin:
-            if file_id and kind == "photo":
-                send_photo(admin, file_id, header)
-            elif file_id:
-                call("sendVideo", chat_id=admin, video=file_id,
-                     caption=header[:1024], parse_mode="HTML")
-            else:
-                send(admin, header)
-        return send(chat_id, "✅ Thanks! Your issue has been sent to the admin. "
-                             "We'll get back to you as soon as possible.",
-                    start_keyboard())
-
     # ---- admin is filling in a value ----
     if step and is_admin(chat_id):
         parts = step.split(":")
@@ -453,38 +416,12 @@ def handle_message(msg):
                 {"inline_keyboard": [[{"text": "✔️ Done", "callback_data": f"mdone:{scope}"}]]},
             )
 
-        if parts[0] == "bcast":
-            set_step(chat_id, "")
-            if not text and not file_id:
-                return send(chat_id, "Send text, a photo or a video to broadcast.")
-            targets = all_chat_ids()
-            sent = failed = 0
-            for cid in targets:
-                try:
-                    if file_id and kind == "photo":
-                        ok = send_photo(cid, file_id, text)
-                    elif file_id:
-                        ok = call("sendVideo", chat_id=cid, video=file_id,
-                                  caption=text[:1024], parse_mode="HTML")
-                    else:
-                        ok = send(cid, text)
-                    if ok and ok.get("ok"):
-                        sent += 1
-                    else:
-                        failed += 1
-                except Exception:
-                    failed += 1
-                time.sleep(0.05)
-            return send(chat_id, f"📢 Broadcast done.\nSent: <b>{sent}</b>\nFailed: <b>{failed}</b>",
-                        dashboard_keyboard())
-
         if parts[0] == "set":
-
             key = parts[1]
-            if key in ("welcome_photo", "qr_photo"):
+            if key == "welcome_photo":
                 if not file_id or kind != "photo":
                     return send(chat_id, "Send a photo, please.")
-                put(key, file_id)
+                put("welcome_photo", file_id)
             else:
                 put(key, text)
             set_step(chat_id, "")
@@ -552,31 +489,8 @@ def handle_message(msg):
             )
         return
 
-    # ---- UTR / transaction id from a customer waiting to pay ----
-    low = text.lower()
-    if text and not low.startswith("/") and not is_admin(chat_id):
-        with db() as c:
-            sel = c.execute(
-                "SELECT * FROM payments WHERE chat_id = ? AND status = 'selected' "
-                "ORDER BY id DESC LIMIT 1",
-                (str(chat_id),),
-            ).fetchone()
-            if sel:
-                c.execute("UPDATE payments SET status = 'pending' WHERE id = ?", (sel["id"],))
-        if sel:
-            send(chat_id, "Received ✅ Your payment is under review. "
-                          "You'll get your access link once it's verified.")
-            who = "@" + frm["username"] if frm.get("username") else frm.get("first_name", str(chat_id))
-            if get("admin_chat_id"):
-                send(get("admin_chat_id"),
-                     f"🧾 <b>Payment for review (UTR)</b>\n{sel['plan_label']} — "
-                     f"₹{int(sel['price'])}\nUTR: <code>{text}</code>\n"
-                     f"From: {who} (<code>{chat_id}</code>)",
-                     review_keyboard(sel["id"]))
-            return
-
     # ---- commands ----
-
+    low = text.lower()
     if low.startswith("/start"):
         items = welcome_media()
         if items:
@@ -601,6 +515,7 @@ def handle_callback(cq):
     def answer(text=""):
         call("answerCallbackQuery", callback_query_id=cq_id, text=text)
 
+    # customer picked a plan
     if data == "howto":
         answer()
         items = media_list("howto")
@@ -610,20 +525,8 @@ def handle_callback(cq):
             send(chat_id, get("howto_text"))
         return send(chat_id, "Ready? Pick a plan 👇", start_keyboard())
 
-    if data == "report":
-        answer()
-        set_step(chat_id, "report")
-        return send(chat_id, get("report_text"), report_keyboard())
-
-    if data == "report_cancel":
-        answer("Cancelled")
-        set_step(chat_id, "")
-        return send(chat_id, "Cancelled. Choose an option below 👇", start_keyboard())
-
-    # customer picked a plan
     if data.startswith("plan:"):
         answer()
-        set_step(chat_id, "")
         pid = data.split(":")[1]
         with db() as c:
             p = c.execute("SELECT * FROM plans WHERE id = ?", (pid,)).fetchone()
@@ -643,18 +546,13 @@ def handle_callback(cq):
                 (str(chat_id), frm.get("username", ""), frm.get("first_name", ""),
                  p["label"], p["price"], time.time()),
             )
-        qr = p["qr_photo"] or get("qr_photo")
-        if not qr:
-            return send(chat_id, "QR is not set yet. Please contact support.")
-        send_photo(chat_id, qr, caption, pay_keyboard(pid))
+        send_photo(chat_id, p["qr_photo"], caption, pay_keyboard(pid))
         return
 
     if data.startswith("paid:"):
-        answer("Send screenshot or UTR")
-        return send(chat_id, "✅ Great!\n\n📸 Please send your payment screenshot, or\n"
-                             "📝 Type your UTR / Transaction ID\n\n"
-                             "We'll verify and activate your plan within 30 minutes.")
-
+        answer("Now send the screenshot")
+        return send(chat_id, "Great ✅ Now send the payment screenshot here. "
+                             "The admin will verify it and send your access link.")
 
     if data == "cancel":
         answer("Cancelled")
@@ -667,16 +565,8 @@ def handle_callback(cq):
     if not is_admin(frm.get("id")):
         return answer("Only the admin can do this.")
 
-    if data == "bcast":
-        set_step(chat_id, "bcast")
-        answer()
-        return send(chat_id, f"📢 Send the message (text, photo or video) to broadcast to all "
-                             f"{len(all_chat_ids())} users.",
-                    {"inline_keyboard": [[{"text": "⬅️ Cancel", "callback_data": "dash"}]]})
-
     if data == "dash":
         answer()
-
         set_step(chat_id, "")
         return send(chat_id, dashboard_text(), dashboard_keyboard())
 
@@ -686,13 +576,9 @@ def handle_callback(cq):
         msg = cq.get("message", {})
         if msg.get("message_id"):
             mark = "✅ APPROVED" if data.startswith("pay_ok:") else "❌ DECLINED"
-            if msg.get("caption") is not None:
-                call("editMessageCaption", chat_id=chat_id, message_id=msg["message_id"],
-                     caption=f"{msg['caption']}\n\n<b>{mark}</b>", parse_mode="HTML")
-            else:
-                call("editMessageText", chat_id=chat_id, message_id=msg["message_id"],
-                     text=f"{msg.get('text', '')}\n\n<b>{mark}</b>", parse_mode="HTML")
-
+            base = msg.get("caption") or ""
+            call("editMessageCaption", chat_id=chat_id, message_id=msg["message_id"],
+                 caption=f"{base}\n\n<b>{mark}</b>", parse_mode="HTML")
         return
 
     if data.startswith("media:"):
@@ -728,8 +614,6 @@ def handle_callback(cq):
         key = data.split(":")[1]
         set_step(chat_id, f"set:{key}")
         answer()
-        if key == "qr_photo":
-            return send(chat_id, "Send the QR photo once — it will be used for ALL plans.")
         prompt = "Send the new photo." if key == "welcome_photo" else "Send the new value."
         return send(chat_id, f"{prompt}\nCurrent: <code>{get(key) or '(empty)'}</code>")
 
