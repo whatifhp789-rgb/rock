@@ -4,7 +4,7 @@ that powers the Aether Control web panel.
 
 Run:
     pip install requests
-    export TELEGRAM_BOT_TOKEN="123:abc"
+    export TELEGRAM_BOT_TOKEN="8959356690:AAFbJp2MCgqAzeFESxFuyopl7c026cVcROk"
     export SUPABASE_URL="https://<project-ref>.supabase.co"
     export SUPABASE_SERVICE_ROLE_KEY="<service role key>"
     python bot.py
